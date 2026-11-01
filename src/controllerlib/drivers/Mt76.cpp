@@ -760,6 +760,8 @@ namespace controllerlib
             }
 
             isWlanPacket = command.eventType == EvtPacketRx;
+            if (!isWlanPacket)
+                m_logger.Log(LogLevel::Info, "DIAG Mt76: CPU event type 0x%02x, %d bytes", static_cast<int>(command.eventType), static_cast<int>(packetSize));
         }
         else if (info.port == WlanPort)
         {
@@ -773,6 +775,17 @@ namespace controllerlib
         WlanFrame wlanFrame;
         std::memcpy(&rxWi, packet, sizeof(rxWi));
         std::memcpy(&wlanFrame, packet + sizeof(RxWi), sizeof(wlanFrame));
+
+        // DIAG: log every management frame (except beacons/probes) to see what the controller sends after pairing.
+        if (wlanFrame.frameControl.type == WlanManagement &&
+            wlanFrame.frameControl.subtype != 0x08 && wlanFrame.frameControl.subtype != 0x04 && wlanFrame.frameControl.subtype != 0x05)
+        {
+            m_logger.Log(LogLevel::Info, "DIAG Mt76: mgmt subtype 0x%02x port %d retry %d src %02x:%02x:%02x:%02x:%02x:%02x dst %02x:%02x:%02x:%02x:%02x:%02x body %d",
+                         wlanFrame.frameControl.subtype, info.port, wlanFrame.frameControl.retry,
+                         wlanFrame.source[0], wlanFrame.source[1], wlanFrame.source[2], wlanFrame.source[3], wlanFrame.source[4], wlanFrame.source[5],
+                         wlanFrame.destination[0], wlanFrame.destination[1], wlanFrame.destination[2], wlanFrame.destination[3], wlanFrame.destination[4], wlanFrame.destination[5],
+                         static_cast<int>(packetSize - sizeof(RxWi) - sizeof(WlanFrame)));
+        }
 
         if (std::memcmp(wlanFrame.destination, m_address.data(), m_address.size()) != 0)
             return event;

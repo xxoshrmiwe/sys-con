@@ -223,8 +223,9 @@ namespace controllerlib
         m_logger->Log(LogLevel::Info, "XboxWirelessAdapter: Pairing controller %02x:%02x:%02x:%02x:%02x:%02x",
                       address[0], address[1], address[2], address[3], address[4], address[5]);
 
-        Status result;
-        if ((result = m_radio->PairClient(address)) != Status::Success ||
+        Status result = m_radio->PairClient(address);
+        m_logger->Log(LogLevel::Info, "DIAG XboxWirelessAdapter: pairing reply sent -> %s", ToString(result));
+        if (result != Status::Success ||
             (result = m_radio->SetPairing(false)) != Status::Success ||
             (result = m_radio->SetLed(Mt76::Led::On)) != Status::Success)
             return result;
