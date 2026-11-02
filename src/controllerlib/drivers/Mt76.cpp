@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 namespace controllerlib
@@ -150,6 +151,7 @@ namespace controllerlib
             FwMacAddressSet = 0,
             FwClientAdd = 1,
             FwClientRemove = 2,
+            FwIdleTimeSet = 5,
             FwChannelCandidatesSet = 7,
         };
 
@@ -157,6 +159,7 @@ namespace controllerlib
         {
             EvtButtonPress = 0x04,
             EvtPacketRx = 0x0c,
+            EvtCoredump = 0x0d,
             EvtClientLost = 0x0e,
         };
 
@@ -580,6 +583,11 @@ namespace controllerlib
         if ((result = SendFirmwareCommand(FwMacAddressSet, m_address.data(), m_address.size())) != Status::Success)
             return result;
 
+        // Keeps idle controllers from being dropped by the adapter firmware (as xone does).
+        const uint32_t idleTime = 64;
+        if ((result = SendFirmwareCommand(FwIdleTimeSet, reinterpret_cast<const uint8_t *>(&idleTime), sizeof(idleTime))) != Status::Success)
+            return result;
+
         // Without this reset, associations are unreliable.
         if ((result = WriteRegister(reg::MacSysCtrl, 0)) != Status::Success ||
             (result = WriteRegister(reg::RfBypass0, 0)) != Status::Success ||
@@ -599,6 +607,9 @@ namespace controllerlib
 
         if ((result = InitChannels()) != Status::Success)
             return result;
+
+        // Mandatory delay after a channel change before the radio is used (xone).
+        std::this_thread::sleep_for(std::chrono::seconds(1));
 
         if ((result = WriteBeacon(false)) != Status::Success)
             return result;
@@ -752,6 +763,12 @@ namespace controllerlib
                 return event;
             }
 
+            if (command.eventType == EvtCoredump)
+            {
+                m_logger.Log(LogLevel::Error, "Mt76: The adapter firmware crashed (coredump event)");
+                return event;
+            }
+
             if (command.eventType == EvtClientLost)
             {
                 event.type = RadioEvent::Type::ClientLost;
@@ -774,11 +791,24 @@ namespace controllerlib
         std::memcpy(&rxWi, packet, sizeof(rxWi));
         std::memcpy(&wlanFrame, packet + sizeof(RxWi), sizeof(wlanFrame));
 
+        // Frame layout as in xone (xone_dongle_process_wlan): the 802.11 header, 2 bytes of
+        // padding after it when the RX info has L2PAD set, then the body. The real frame
+        // length is the RXWI MPDU length; anything after it is transfer padding.
+        const bool isQosData = wlanFrame.frameControl.type == WlanData && wlanFrame.frameControl.subtype == WlanQosData;
+        const size_t headerSize = sizeof(WlanFrame) + (isQosData ? sizeof(QosFrame) : 0);
+        const size_t padding = (rxWi.dmaLength & Bit(14)) ? 2 : 0;
+        const size_t frameSpace = packetSize - sizeof(RxWi);
+        const size_t mpduSize = rxWi.mpduByteCount;
+
+        // Drop truncated frames, typically the chip's own beacons looped back (xone commit 83bd053).
+        if (mpduSize < headerSize || mpduSize + padding > frameSpace)
+            return event;
+
         if (std::memcmp(wlanFrame.destination, m_address.data(), m_address.size()) != 0)
             return event;
 
-        const uint8_t *body = packet + sizeof(RxWi) + sizeof(WlanFrame);
-        const size_t bodySize = packetSize - sizeof(RxWi) - sizeof(WlanFrame);
+        const uint8_t *body = packet + sizeof(RxWi) + headerSize + padding;
+        const size_t bodySize = mpduSize - headerSize;
         std::memcpy(event.address.data(), wlanFrame.source, event.address.size());
         event.wcid = rxWi.wcid;
 
@@ -787,8 +817,15 @@ namespace controllerlib
             switch (wlanFrame.frameControl.subtype)
             {
                 case WlanAssociationRequest:
-                    event.type = RadioEvent::Type::ClientAssociating;
+                {
+                    // Spurious association frames can carry multicast or all-zero source
+                    // addresses; a real controller always uses a unicast one (xone commit ff37408).
+                    const bool multicast = (wlanFrame.source[0] & 0x01) != 0;
+                    const bool zero = std::all_of(wlanFrame.source, wlanFrame.source + 6, [](uint8_t b) { return b == 0; });
+                    if (!multicast && !zero)
+                        event.type = RadioEvent::Type::ClientAssociating;
                     break;
+                }
 
                 // 1537 controllers associate, disassociate and associate again while pairing,
                 // and those disassociations never raise EvtClientLost.
@@ -802,16 +839,11 @@ namespace controllerlib
                     break;
             }
         }
-        else if (wlanFrame.frameControl.type == WlanData && wlanFrame.frameControl.subtype == WlanQosData)
+        else if (isQosData && bodySize > 0)
         {
-            // The QoS control field is followed by 2 bytes of L2 padding.
-            constexpr size_t QosHeaderSize = sizeof(QosFrame) + sizeof(uint16_t);
-            if (bodySize > QosHeaderSize)
-            {
-                event.type = RadioEvent::Type::ClientData;
-                event.data = body + QosHeaderSize;
-                event.size = bodySize - QosHeaderSize;
-            }
+            event.type = RadioEvent::Type::ClientData;
+            event.data = body;
+            event.size = bodySize;
         }
 
         return event;
@@ -864,7 +896,14 @@ namespace controllerlib
             return result;
         }
 
-        if ((result = WriteRegister(reg::FceDmaAddr, 0, VendWriteCfg)) != Status::Success ||
+        if ((result = WriteRegister(reg::FceDmaAddr, 0, VendWriteCfg)) != Status::Success)
+            return result;
+
+        // Same power-on RF patch as the warm reset path. Without it the RF does not initialise
+        // correctly on a cold upload (xone commit e0ab753).
+        uint32_t patch;
+        if ((result = ReadRegister(reg::RfPatch, &patch, VendReadCfg)) != Status::Success ||
+            (result = WriteRegister(reg::RfPatch, patch & ~Bit(19), VendWriteCfg)) != Status::Success ||
             (result = WriteRegister(FwLoadIvb, 0, VendDevMode)) != Status::Success)
             return result;
 
@@ -1107,7 +1146,8 @@ namespace controllerlib
         value = (value & 0x7f) + offset;
 
         uint32_t control;
-        if ((result = ReadRegister(reg::XoCtrl5, &control)) != Status::Success)
+        // Read from the same CFG space it is written to (xow read the MAC space here; fixed in xone).
+        if ((result = ReadRegister(reg::XoCtrl5, &control, VendReadCfg)) != Status::Success)
             return result;
 
         control &= ~reg::XoCtrl5C2Val;
@@ -1121,7 +1161,6 @@ namespace controllerlib
 
     Status Mt76::InitChannels()
     {
-        // The original driver raises the power for channels 0x24 - 0x30, sometimes past the 0x2f maximum.
         static constexpr struct
         {
             uint8_t channel;
@@ -1142,18 +1181,53 @@ namespace controllerlib
             {0xa5, BandwidthMhz80, false},
         };
 
+        // Evaluate every channel and operate on the one with the highest calibrated TX power,
+        // instead of a fixed channel (xone: xone_mt76_init_channels / evaluate_channels).
         Status result;
-        for (const auto &entry : Channels)
+        if ((result = WriteRegister(reg::RxFiltrCfg, 0x014f13)) != Status::Success)
+            return result;
+
+        size_t best = 0;
+        uint8_t bestPower = 0;
+        for (size_t i = 0; i < std::size(Channels); i++)
         {
-            if ((result = ConfigureChannel(entry.channel, entry.bandwidth, entry.scan)) != Status::Success)
+            if ((result = ConfigureChannel(Channels[i].channel, Channels[i].bandwidth, Channels[i].scan)) != Status::Success)
                 return result;
+
+            const uint8_t power = GetChannelPower(Channels[i].channel);
+            if (power > bestPower)
+            {
+                bestPower = power;
+                best = i;
+            }
         }
 
-        static constexpr uint8_t Candidates[] = {0x01, 0xa5, 0x0b, 0x01, 0x06, 0x0b, 0x24, 0x28, 0x2c, 0x30, 0x95, 0x99, 0x9d, 0xa1};
+        if ((result = WriteRegister(reg::RxFiltrCfg, 0x017f17)) != Status::Success)
+            return result;
 
+        const auto &channel = Channels[best];
+        m_logger.Log(LogLevel::Info, "Mt76: Operating channel %d (power %d)", channel.channel, bestPower);
+
+        if ((result = ConfigureChannel(channel.channel, channel.bandwidth, true)) != Status::Success ||
+            (result = SetPowerMode(RadioOff)) != Status::Success)
+            return result;
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+        if ((result = SetPowerMode(RadioOn)) != Status::Success ||
+            (result = ConfigureChannel(channel.channel, channel.bandwidth, false)) != Status::Success)
+            return result;
+
+        // Candidate list: count of preferred channels (1), the preferred one, then the others.
         ByteWriter values;
-        for (uint32_t channel : Candidates)
-            values.Append(channel);
+        values.Append(uint32_t{1});
+        values.Append(uint32_t{channel.channel});
+        values.Append(static_cast<uint32_t>(std::size(Channels) - 1));
+        for (size_t i = 0; i < std::size(Channels); i++)
+        {
+            if (i != best)
+                values.Append(uint32_t{Channels[i].channel});
+        }
 
         return SendFirmwareCommand(FwChannelCandidatesSet, values.Data(), values.Size());
     }

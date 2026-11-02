@@ -226,6 +226,15 @@ namespace
         packet.insert(packet.end(), 2, 0);
         packet.insert(packet.end(), body.begin(), body.end());
 
+        // Like the real chip: QoS data carries 2 bytes of padding after its 26-byte header,
+        // flagged by L2PAD, and the RXWI holds the MPDU length without that padding.
+        const bool isQosData = ((frameControl >> 2) & 0x03) == 2 && (frameControl >> 4) == 8;
+        const size_t mpdu = 24 + body.size() - (isQosData ? 2 : 0);
+        if (isQosData)
+            packet[1] |= 0x40; // RXINFO L2PAD (bit 14)
+        packet[6] = static_cast<uint8_t>(mpdu & 0xff);
+        packet[7] = static_cast<uint8_t>((mpdu >> 8) & 0x3f);
+
         constexpr uint32_t Is80211 = 1u << 19;
         return Transfer(Is80211, packet);
     }
@@ -468,4 +477,41 @@ TEST(XboxWirelessAdapter, events_are_picked_up_while_idle)
     uint16_t slot;
     EXPECT_EQ(fixture.adapter->ReadInput(&data, &slot, 10000), Status::NothingTodo);
     EXPECT_FALSE(fixture.adapter->IsControllerConnected(0));
+}
+
+TEST(XboxWirelessAdapter, repeated_association_request_is_ignored)
+{
+    Fixture fixture;
+    ASSERT_EQ(fixture.adapter->Initialize(), Status::Success);
+
+    NormalizedButtonData data;
+    uint16_t slot;
+
+    fixture.interface->PacketIn().reads.push_back(WlanTransfer(0x00, 0, AssociationBody));
+    EXPECT_EQ(fixture.Read(&data, &slot), Status::NothingTodo);
+    fixture.interface->Out().writes.clear();
+
+    // A retransmitted request must not register the controller with the firmware again.
+    fixture.interface->PacketIn().reads.push_back(WlanTransfer(0x00, 0, AssociationBody));
+    EXPECT_EQ(fixture.Read(&data, &slot), Status::NothingTodo);
+    EXPECT_FALSE(AnyWriteContains(fixture.interface->Out(), Bytes(ClientAddress, ClientAddress + 6)));
+}
+
+TEST(XboxWirelessAdapter, truncated_frames_are_dropped)
+{
+    Fixture fixture;
+    ASSERT_EQ(fixture.adapter->Initialize(), Status::Success);
+    fixture.interface->Out().writes.clear();
+
+    NormalizedButtonData data;
+    uint16_t slot;
+
+    // RXWI claims more bytes than the transfer holds, like the chip's own looped-back beacons.
+    Bytes transfer = WlanTransfer(0x00, 0, AssociationBody);
+    transfer[4 + 6] = 0xff;
+    transfer[4 + 7] = 0x0f;
+    fixture.interface->PacketIn().reads.push_back(transfer);
+    fixture.Read(&data, &slot);
+    EXPECT_FALSE(fixture.adapter->IsControllerConnected(0));
+    EXPECT_FALSE(AnyWriteContains(fixture.interface->Out(), Bytes(ClientAddress, ClientAddress + 6)));
 }

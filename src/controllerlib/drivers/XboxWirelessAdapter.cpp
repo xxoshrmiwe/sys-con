@@ -28,6 +28,12 @@ namespace controllerlib
         constexpr uint8_t GipMotorAll = 0x0f;
         constexpr uint8_t GipMotorLevelMax = 100;
 
+        // At most one rumble packet per controller in this window; a stop (both motors 0) is never delayed.
+        constexpr auto RumbleMinInterval = std::chrono::milliseconds(50);
+
+        // Association requests repeated within this window are retransmissions, not reconnects.
+        constexpr auto AssociationRepeatWindow = std::chrono::seconds(2);
+
         constexpr PinId GuideButtonPin{12};
 
         uint8_t WcidOf(uint16_t slot) { return static_cast<uint8_t>(slot + 1); }
@@ -148,6 +154,13 @@ namespace controllerlib
     {
         uint8_t transfer[Mt76::MaxTransferSize];
 
+        // Deliver rumble values that were held back by the throttle.
+        for (uint16_t slot = 0; slot < m_clients.size(); slot++)
+        {
+            if (m_clients[slot].announced && m_clients[slot].rumblePending)
+                (void)FlushRumble(slot);
+        }
+
         for (IUSBEndpoint *endpoint : {m_packetEndpoint, m_eventEndpoint})
         {
             size_t transferSize = sizeof(transfer);
@@ -236,6 +249,14 @@ namespace controllerlib
     {
         // A controller that reassociates without having been lost keeps its slot.
         std::optional<uint16_t> slot = FindSlot(address);
+
+        // Controllers retransmit the association request before the first one is answered.
+        // Registering the same client twice with the adapter firmware made it drop the
+        // controller and then fall off the USB bus, so ignore quick repeats (xone commit 030f16c).
+        const auto now = std::chrono::steady_clock::now();
+        if (slot && m_clients[*slot].associated && now - m_clients[*slot].associatedAt < AssociationRepeatWindow)
+            return Status::NothingTodo;
+
         if (!slot)
             slot = FindFreeSlot();
 
@@ -253,6 +274,7 @@ namespace controllerlib
         Client &client = m_clients[*slot];
         client = Client{};
         client.associated = true;
+        client.associatedAt = now;
         client.address = address;
         *input_idx = *slot;
 
@@ -366,15 +388,49 @@ namespace controllerlib
         if (input_idx >= m_clients.size() || !m_clients[input_idx].announced)
             return Status::InvalidIndex;
 
+        Client &client = m_clients[input_idx];
+        client.rumblePendingLow = static_cast<uint8_t>(ScaleAmplitude(rumble.LowAmplitude(), GipMotorLevelMax));
+        client.rumblePendingHigh = static_cast<uint8_t>(ScaleAmplitude(rumble.HighAmplitude(), GipMotorLevelMax));
+        client.rumblePending = true;
+
+        return FlushRumble(input_idx);
+    }
+
+    Status XboxWirelessAdapter::FlushRumble(uint16_t slot)
+    {
+        Client &client = m_clients[slot];
+        if (!client.rumblePending)
+            return Status::Success;
+
+        // Raw amplitudes change far more often than the 0-100 motor levels the controller understands.
+        if (client.rumblePendingLow == client.rumbleSentLow && client.rumblePendingHigh == client.rumbleSentHigh)
+        {
+            client.rumblePending = false;
+            return Status::Success;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        const bool stopping = client.rumblePendingLow == 0 && client.rumblePendingHigh == 0;
+        if (!stopping && now - client.rumbleSentAt < RumbleMinInterval)
+            return Status::Success; // Sent later by ReadNextBuffer, with the latest value.
+
         // The last byte is the repeat count; with 0 the effect plays once and dies while the
         // game keeps holding the same amplitude.
         const uint8_t payload[] = {
             0x00, GipMotorAll, 0x00, 0x00,
-            static_cast<uint8_t>(ScaleAmplitude(rumble.LowAmplitude(), GipMotorLevelMax)),
-            static_cast<uint8_t>(ScaleAmplitude(rumble.HighAmplitude(), GipMotorLevelMax)),
+            client.rumblePendingLow,
+            client.rumblePendingHigh,
             0xff, 0x00, 0xff};
 
-        return SendGip(input_idx, GipCmdRumble, 0x00, payload, sizeof(payload));
+        Status result = SendGip(slot, GipCmdRumble, 0x00, payload, sizeof(payload));
+        if (result != Status::Success)
+            return result;
+
+        client.rumbleSentLow = client.rumblePendingLow;
+        client.rumbleSentHigh = client.rumblePendingHigh;
+        client.rumbleSentAt = now;
+        client.rumblePending = false;
+        return Status::Success;
     }
 
     Status XboxWirelessAdapter::SendGip(uint16_t slot, uint8_t command, uint8_t options, const uint8_t *payload, uint8_t payloadSize)
