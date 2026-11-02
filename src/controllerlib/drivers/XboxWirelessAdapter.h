@@ -3,6 +3,7 @@
 #include "BaseController.h"
 #include "drivers/Mt76.h"
 #include <array>
+#include <chrono>
 #include <memory>
 #include <optional>
 
@@ -41,6 +42,16 @@ namespace controllerlib
             MacAddress address{};
             uint8_t sequence = 0;
             RawInputData input{};
+
+            // Rumble throttling: Switch games (HD rumble) change the amplitude almost every frame,
+            // and forwarding each change as its own radio packet floods the adapter until it drops
+            // the controllers and finally falls off the USB bus.
+            uint8_t rumbleSentLow = 0;
+            uint8_t rumbleSentHigh = 0;
+            uint8_t rumblePendingLow = 0;
+            uint8_t rumblePendingHigh = 0;
+            bool rumblePending = false;
+            std::chrono::steady_clock::time_point rumbleSentAt{};
         };
 
         Status HandleTransfer(const uint8_t *transfer, size_t transferSize, uint8_t *buffer, size_t *size, uint16_t *input_idx);
@@ -52,6 +63,7 @@ namespace controllerlib
 
         Status SendGip(uint16_t slot, uint8_t command, uint8_t options, const uint8_t *payload, uint8_t payloadSize);
         Status SendGipAck(uint16_t slot, const uint8_t *frame);
+        Status FlushRumble(uint16_t slot);
         uint8_t NextSequence(Client &client);
 
         std::optional<uint16_t> FindSlot(const MacAddress &address) const;
